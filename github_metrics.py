@@ -16,6 +16,7 @@ import pandas as pd
 import numpy as np
 import streamlit as st
 import matplotlib.pyplot as plt
+from collections import Counter
 
 # ---------------------------
 # Config / auth
@@ -393,30 +394,30 @@ def fetch_prs(owner: str, repo: str, since: Optional[str], until: Optional[str],
     # --- Fetch per-PR detail stats ---
     additions, deletions, changed_files, commits = [], [], [], []
 
-    st.write(f"Fetching detailed stats for {len(df)} PRs...")
+    # st.write(f"Fetching detailed stats for {len(df)} PRs...")
+    with st.spinner(f"Fetching detailed stats for {len(df)} PRs..."):
+        for _, row in df.iterrows():
+            pr_number = int(row["number"])
+            detail_url = f"{API_BASE}/repos/{owner}/{repo}/pulls/{pr_number}"
+            try:
+                r = gh_get(detail_url)
+                detail = r.json()
+                additions.append(detail.get("additions", 0))
+                deletions.append(detail.get("deletions", 0))
+                changed_files.append(detail.get("changed_files", 0))
+                commits.append(detail.get("commits", 0))
+                # short delay to avoid secondary rate limit
+                time.sleep(0.2)
+            except Exception as e:
+                additions.append(np.nan)
+                deletions.append(np.nan)
+                changed_files.append(np.nan)
+                commits.append(np.nan)
 
-    for _, row in df.iterrows():
-        pr_number = int(row["number"])
-        detail_url = f"{API_BASE}/repos/{owner}/{repo}/pulls/{pr_number}"
-        try:
-            r = gh_get(detail_url)
-            detail = r.json()
-            additions.append(detail.get("additions", 0))
-            deletions.append(detail.get("deletions", 0))
-            changed_files.append(detail.get("changed_files", 0))
-            commits.append(detail.get("commits", 0))
-            # short delay to avoid secondary rate limit
-            time.sleep(0.2)
-        except Exception as e:
-            additions.append(np.nan)
-            deletions.append(np.nan)
-            changed_files.append(np.nan)
-            commits.append(np.nan)
-
-    df["additions"] = additions
-    df["deletions"] = deletions
-    df["changed_files"] = changed_files
-    df["commits"] = commits
+        df["additions"] = additions
+        df["deletions"] = deletions
+        df["changed_files"] = changed_files
+        df["commits"] = commits
 
     return df
 
@@ -424,6 +425,80 @@ def fetch_prs(owner: str, repo: str, since: Optional[str], until: Optional[str],
 def fetch_pr_reviews(owner: str, repo: str, pr_number: int) -> List[dict]:
     url = f"{API_BASE}/repos/{owner}/{repo}/pulls/{pr_number}/reviews"
     return paginate(url)
+
+
+
+@st.cache_data(ttl=60 * 30)
+def fetch_contributors_by_date(owner: str, repo: str, since: Optional[str], until: Optional[str], max_commits: int = 5000) -> pd.DataFrame:
+    """
+    Return contributor commit counts restricted to the date range [since, until].
+    - Uses the commits REST endpoint: /repos/{owner}/{repo}/commits?since=...&until=...
+    - Aggregates by commit author login (falls back to commit.author.name/email when login missing).
+    - max_commits: safety cap to avoid enumerating huge histories (increase if you know size).
+    Returns DataFrame with columns: user, commits (int).
+    """
+    if not owner or not repo:
+        return pd.DataFrame(columns=["user", "commits"])
+
+    params = {}
+    if since:
+        params["since"] = pd.to_datetime(since).isoformat()
+    if until:
+        # include full 'until' day by adding one day - 1 microsecond
+        until_dt = pd.to_datetime(until)
+        params["until"] = (until_dt + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)).isoformat()
+
+    base = f"{API_BASE}/repos/{owner}/{repo}/commits"
+    per_page = 100
+    page = 1
+    seen = 0
+    counts = Counter()
+
+    while True:
+        params_page = dict(params)
+        params_page["per_page"] = per_page
+        params_page["page"] = page
+        try:
+            r = gh_get(base, params=params_page)
+            commits = r.json()
+        except Exception as e:
+            st.warning(f"Error fetching commits page {page}: {e}")
+            break
+
+        if not commits:
+            break
+
+        for c in commits:
+            # prefer author.login when available (GitHub account)
+            author = None
+            if c.get("author") and isinstance(c["author"], dict):
+                author = c["author"].get("login")
+            # fallback to commit author name/email (non-GitHub authors)
+            if not author:
+                commit_info = c.get("commit", {}).get("author", {}) or {}
+                # use email if available (safer unique), else name
+                author = commit_info.get("email") or commit_info.get("name") or "unknown"
+            counts[author] += 1
+            seen += 1
+            if seen >= max_commits:
+                break
+
+        # break conditions
+        if seen >= max_commits:
+            st.info(f"Reached max_commits cap ({max_commits}) while fetching commits.")
+            break
+
+        # pagination: if fewer than per_page returned, done
+        if len(commits) < per_page:
+            break
+        page += 1
+
+    # build DataFrame sorted desc by commits
+    rows = [{"user": user, "commits": cnt} for user, cnt in counts.most_common()]
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    return df
 
 @st.cache_data(ttl=60 * 30)
 def fetch_contributors(owner: str, repo: str) -> pd.DataFrame:
@@ -520,8 +595,8 @@ def run_app():
     )
     api_base_input = st.sidebar.text_input(
         "GitHub API base URL",
-        value=os.environ.get("API_BASE", "https://api.github.com"),
-        help="Usually https://api.github.com. Change only if using a GitHub Enterprise server."
+        value=os.environ.get("API_BASE", "https://api.github.com/"),
+        help="Usually https://api.github.com/. Change only if using a GitHub Enterprise server."
     )
 
     # Normalize inputs
@@ -597,7 +672,8 @@ def run_app():
                 st.warning("No PRs found for this repo/time range.")
                 st.stop()
 
-            contributors = fetch_contributors(owner, repo)
+            # contributors = fetch_contributors(owner, repo)
+            contributors = fetch_contributors_by_date(owner, repo, since.isoformat(), until.isoformat(), max_commits=2000)
             df_metrics = compute_pr_metrics(df_prs, owner, repo, sample_reviews=sample_reviews)
             if "changed_files" in df_metrics.columns:
                 df_metrics = df_metrics[df_metrics["changed_files"].fillna(0) >= int(min_pr_size)]
